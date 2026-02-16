@@ -1,12 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import maplibregl from "maplibre-gl";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import { ScenegraphLayer } from "@deck.gl/mesh-layers";
+import { centroid, transformRotate } from "@turf/turf";
 import "maplibre-gl/dist/maplibre-gl.css";
-import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
 import "./App.css";
-import { attachDraw } from "./map/draw";
-import { DrawPolygonControl } from "./map/DrawPolygonControl";
 import { addRoadLayers, ROAD_LAYER_IDS, updateRoadSourceData } from "./map/layers";
 import { buildGraphFromGeoJSON } from "./traffic/graph";
 import {
@@ -30,6 +28,13 @@ import {
 import type { Edge, EdgeMetric, FeatureMetric, Graph, ODPair, RoadFeatureProperties } from "./traffic/types";
 import { applyMetricsToRoads } from "./traffic/updateGeo";
 import { SimulationResultsPanel } from "./components/SimulationResultsPanel";
+import {
+  BUILDING_TEMPLATE_MIME,
+  BuildingPalette,
+  type BuildingTemplate,
+} from "./components/BuildingPalette";
+import { overlapsBasemapBuildings, overlapsUserBuildings } from "./map/overlap";
+import { snapToRoadOrientation, type BuildingModelType } from "./map/snapToRoad";
 import { fetchAndConvertMapboxStyle, type MapboxStyle } from "./utils/mapbox-style-converter";
 
 type RoadCollection = GeoJSON.FeatureCollection<GeoJSON.LineString, RoadFeatureProperties>;
@@ -51,12 +56,6 @@ type FeatureLike = {
   geometry?: GeoJSON.Geometry;
 };
 
-type BuildingModelType =
-  | "building"
-  | "large-building"
-  | "schoolhouse"
-  | "construction-sign"
-  | "restaurant";
 type BuildingModelOption = {
   id: BuildingModelType;
   label: string;
@@ -73,6 +72,20 @@ type ScenegraphBuildingInstance = {
   position: [number, number, number];
   scale: [number, number, number];
   orientation: [number, number, number];
+};
+type PlacementCheckResult = {
+  feature: GeoJSON.Feature<GeoJSON.Polygon>;
+  overlapsUser: boolean;
+  overlapsRoad: boolean;
+  overlapsBasemap: boolean;
+};
+type PlacementCheckOptions = {
+  includeBasemap?: boolean;
+  rotationOffsetDeg?: number;
+};
+type TopPopup = {
+  message: string;
+  kind: "warning" | "info";
 };
 
 const INITIAL_CENTER: [number, number] = [-79.385, 45];
@@ -126,10 +139,8 @@ const DEFAULT_MODEL_RENDER_PARAMS = {
 const BASE_BUILDING_HEIGHT_M = 40;
 const MIN_MODEL_SCALE_PERCENT = 10;
 const MAX_MODEL_SCALE_PERCENT = 500;
-const DEFAULT_MODEL_SCALE_PERCENT = "100";
 const MIN_MODEL_ROTATION_DEG = -180;
 const MAX_MODEL_ROTATION_DEG = 180;
-const DEFAULT_MODEL_ROTATION_DEG = "0";
 const BUILDING_MODEL_OPTIONS: ReadonlyArray<BuildingModelOption> = [
   {
     id: "building",
@@ -180,6 +191,90 @@ const BUILDING_MODEL_OPTIONS: ReadonlyArray<BuildingModelOption> = [
     supersizeMultiplier: 1,
   },
 ];
+const BUILDING_TEMPLATES: ReadonlyArray<BuildingTemplate> = [
+  {
+    id: "store-small",
+    label: "Store Small",
+    widthM: 15,
+    depthM: 15,
+    defaultHeightM: 20,
+    modelType: "building",
+  },
+  {
+    id: "store-medium",
+    label: "Store Medium",
+    widthM: 22,
+    depthM: 20,
+    defaultHeightM: 24,
+    modelType: "building",
+  },
+  {
+    id: "store-large",
+    label: "Store Large",
+    widthM: 30,
+    depthM: 26,
+    defaultHeightM: 30,
+    modelType: "building",
+  },
+  {
+    id: "restaurant-small",
+    label: "Restaurant Small",
+    widthM: 18,
+    depthM: 14,
+    defaultHeightM: 20,
+    modelType: "restaurant",
+  },
+  {
+    id: "restaurant-medium",
+    label: "Restaurant Medium",
+    widthM: 24,
+    depthM: 18,
+    defaultHeightM: 24,
+    modelType: "restaurant",
+  },
+  {
+    id: "restaurant-large",
+    label: "Restaurant Large",
+    widthM: 30,
+    depthM: 24,
+    defaultHeightM: 30,
+    modelType: "restaurant",
+  },
+  {
+    id: "large-building-medium",
+    label: "Large Building Medium",
+    widthM: 32,
+    depthM: 26,
+    defaultHeightM: 30,
+    modelType: "large-building",
+  },
+  {
+    id: "large-building-xl",
+    label: "Large Building XL",
+    widthM: 40,
+    depthM: 32,
+    defaultHeightM: 36,
+    modelType: "large-building",
+  },
+  {
+    id: "schoolhouse",
+    label: "Schoolhouse",
+    widthM: 28,
+    depthM: 20,
+    defaultHeightM: 18,
+    modelType: "schoolhouse",
+  },
+  {
+    id: "construction-sign",
+    label: "Construction Sign",
+    widthM: 4,
+    depthM: 4,
+    defaultHeightM: 6,
+    modelType: "construction-sign",
+  },
+];
+const ROTATION_STEP_DEG = 15;
+const ROTATION_STEP_LARGE_DEG = 90;
 
 const DEFAULT_STATS: SimulationStats = {
   nodes: 0,
@@ -346,17 +441,6 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function scalePercentToFactor(value: string): number {
-  const parsed = Number.parseFloat(value);
-  const normalizedPercent = Number.isFinite(parsed) ? parsed : 100;
-  return clampNumber(normalizedPercent, MIN_MODEL_SCALE_PERCENT, MAX_MODEL_SCALE_PERCENT) / 100;
-}
-
-function factorToScalePercentString(factor: number): string {
-  const percent = clampNumber(factor * 100, MIN_MODEL_SCALE_PERCENT, MAX_MODEL_SCALE_PERCENT);
-  return String(Math.round(percent));
-}
-
 function readFeatureScaleFactor(properties: Record<string, unknown>, key: "scaleLength" | "scaleWidth" | "scaleHeight"): number {
   const parsed = Number.parseFloat(String(properties[key] ?? 1));
   const value = Number.isFinite(parsed) ? parsed : 1;
@@ -373,12 +457,6 @@ function readFeatureScaleFactorOrDefault(
     return clampNumber(defaultValue, MIN_MODEL_SCALE_PERCENT / 100, MAX_MODEL_SCALE_PERCENT / 100);
   }
   return readFeatureScaleFactor(properties, key);
-}
-
-function rotationDegreesFromString(value: string): number {
-  const parsed = Number.parseFloat(value);
-  const normalized = Number.isFinite(parsed) ? parsed : 0;
-  return clampNumber(normalized, MIN_MODEL_ROTATION_DEG, MAX_MODEL_ROTATION_DEG);
 }
 
 function readFeatureRotationDeg(properties: Record<string, unknown>): number {
@@ -435,6 +513,11 @@ function asBuildingModelType(value: unknown): BuildingModelType | null {
 function getBuildingModelOption(modelType: BuildingModelType): BuildingModelOption {
   const option = BUILDING_MODEL_OPTIONS.find((item) => item.id === modelType);
   return option ?? BUILDING_MODEL_OPTIONS[0];
+}
+
+function getBuildingTemplate(templateId: string): BuildingTemplate {
+  const template = BUILDING_TEMPLATES.find((item) => item.id === templateId);
+  return template ?? BUILDING_TEMPLATES[0];
 }
 
 function polygonFeatureCenter(feature: GeoJSON.Feature): [number, number] | null {
@@ -538,98 +621,76 @@ function buildScenegraphInstances(
   return instances;
 }
 
-function rectangleCoordinates(
-  start: [number, number],
-  end: [number, number],
-): GeoJSON.Position[][] {
-  const [lng1, lat1] = start;
-  const [lng2, lat2] = end;
-  const minLng = Math.min(lng1, lng2);
-  const maxLng = Math.max(lng1, lng2);
-  const minLat = Math.min(lat1, lat2);
-  const maxLat = Math.max(lat1, lat2);
-  return [[
-    [minLng, minLat],
-    [maxLng, minLat],
-    [maxLng, maxLat],
-    [minLng, maxLat],
-    [minLng, minLat],
-  ]];
+function normalizeRotationDegrees(value: number): number {
+  let normalized = ((value % 360) + 360) % 360;
+  if (normalized > 180) {
+    normalized -= 360;
+  }
+  return normalized;
 }
 
-function rectangleCoordinatesScreenAligned(
-  map: maplibregl.Map,
-  start: [number, number],
-  end: [number, number],
+function rectangleCoordinatesFromCenter(
+  center: [number, number],
+  widthM: number,
+  depthM: number,
+  rotationDeg: number,
 ): GeoJSON.Position[][] {
-  const startPx = map.project(start);
-  const endPx = map.project(end);
-  const minX = Math.min(startPx.x, endPx.x);
-  const maxX = Math.max(startPx.x, endPx.x);
-  const minY = Math.min(startPx.y, endPx.y);
-  const maxY = Math.max(startPx.y, endPx.y);
+  const [centerLng, centerLat] = center;
+  const latRad = (centerLat * Math.PI) / 180;
+  const metersPerDegLat = 111320;
+  const metersPerDegLng = Math.max(1, Math.cos(latRad) * metersPerDegLat);
+  const theta = (rotationDeg * Math.PI) / 180;
+  const cosTheta = Math.cos(theta);
+  const sinTheta = Math.sin(theta);
+  const halfWidth = widthM / 2;
+  const halfDepth = depthM / 2;
 
-  const corners = [
-    [minX, minY],
-    [maxX, minY],
-    [maxX, maxY],
-    [minX, maxY],
-    [minX, minY],
-  ] as const;
-
-  return [
-    corners.map(([x, y]) => {
-      const lngLat = map.unproject([x, y]);
-      return [lngLat.lng, lngLat.lat] as GeoJSON.Position;
-    }),
+  const localCorners: Array<[number, number]> = [
+    [-halfWidth, -halfDepth],
+    [halfWidth, -halfDepth],
+    [halfWidth, halfDepth],
+    [-halfWidth, halfDepth],
   ];
+
+  const ring = localCorners.map(([x, y]) => {
+    const rotatedX = x * cosTheta - y * sinTheta;
+    const rotatedY = x * sinTheta + y * cosTheta;
+    const lng = centerLng + rotatedX / metersPerDegLng;
+    const lat = centerLat + rotatedY / metersPerDegLat;
+    return [lng, lat] as GeoJSON.Position;
+  });
+  ring.push(ring[0]);
+  return [ring];
 }
 
-function createRectangleFeature(
+function createPlacementFeature(
   id: string,
-  start: [number, number],
-  end: [number, number],
+  coordinates: GeoJSON.Position[][],
   height: number,
   modelType: BuildingModelType,
-  scaleLength: number,
-  scaleWidth: number,
-  scaleHeight: number,
   rotationDeg: number,
   selected = false,
-  coordinatesOverride?: GeoJSON.Position[][],
 ): GeoJSON.Feature<GeoJSON.Polygon> {
   return {
     type: "Feature",
     id,
     geometry: {
       type: "Polygon",
-      coordinates: coordinatesOverride ?? rectangleCoordinates(start, end),
+      coordinates,
     },
     properties: {
       id,
       height,
-      type: "rectangle-building",
+      type: "palette-building",
       baseHeight: 0,
       modelType,
-      scaleLength,
-      scaleWidth,
-      scaleHeight,
-      rotationDeg,
+      scaleLength: 1,
+      scaleWidth: 1,
+      scaleHeight: 1,
+      rotationDeg: normalizeRotationDegrees(rotationDeg),
       selected,
     },
   };
-}
-
-function rectangleAreaTooSmallScreen(
-  map: maplibregl.Map,
-  start: [number, number],
-  end: [number, number],
-): boolean {
-  const startPx = map.project(start);
-  const endPx = map.project(end);
-  const deltaX = Math.abs(startPx.x - endPx.x);
-  const deltaY = Math.abs(startPx.y - endPx.y);
-  return deltaX < 4 || deltaY < 4;
 }
 
 function emptyTrafficPointCollection(): GeoJSON.FeatureCollection<
@@ -1231,21 +1292,18 @@ export default function App() {
   const trafficAnimationFrameRef = useRef<number | null>(null);
   const trafficLastFrameRef = useRef(0);
   const recomputeTimerRef = useRef<number | null>(null);
-  const drawControlRef = useRef<DrawPolygonControl | null>(null);
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   const polygonBuildingsRef = useRef<Map<string, GeoJSON.Feature>>(new Map());
   const selectedPolygonBuildingIdRef = useRef<string | null>(null);
   const selectedModelTypeRef = useRef<BuildingModelType>("building");
-  const buildingModeRef = useRef(false);
-  const drawModeRef = useRef(false);
-  const modelLengthScaleRef = useRef(DEFAULT_MODEL_SCALE_PERCENT);
-  const modelWidthScaleRef = useRef(DEFAULT_MODEL_SCALE_PERCENT);
-  const modelHeightScaleRef = useRef(DEFAULT_MODEL_SCALE_PERCENT);
-  const modelRotationDegRef = useRef(DEFAULT_MODEL_ROTATION_DEG);
-  const rectangleDragActiveRef = useRef(false);
-  const rectangleDragStartRef = useRef<[number, number] | null>(null);
-  const rectangleDragCurrentRef = useRef<[number, number] | null>(null);
-  const rectFirstCornerRef = useRef<[number, number] | null>(null);
+  const selectedTemplateIdRef = useRef<string>(BUILDING_TEMPLATES[0]?.id ?? "");
+  const draggingTemplateRef = useRef<BuildingTemplate | null>(null);
+  const dragPreviewFeatureRef = useRef<GeoJSON.Feature<GeoJSON.Polygon> | null>(null);
+  const dragPreviewLatestRef = useRef<{ center: [number, number]; template: BuildingTemplate } | null>(null);
+  const dragRotationOffsetDegRef = useRef(0);
+  const dragPreviewFrameRef = useRef<number | null>(null);
+  const dragPreviewPendingRef = useRef<{ center: [number, number]; template: BuildingTemplate } | null>(null);
+  const topPopupTimerRef = useRef<number | null>(null);
 
   const [mapStyle, setMapStyle] = useState<MapboxStyle | string | null>(null);
   const [cursorCoordinates, setCursorCoordinates] = useState<{ lng: number; lat: number } | null>(
@@ -1259,65 +1317,10 @@ export default function App() {
 
   const [selectedPolygonBuildingId, setSelectedPolygonBuildingId] = useState<string | null>(null);
   const [selectedModelType, setSelectedModelType] = useState<BuildingModelType>("building");
-  const [buildingMode, setBuildingMode] = useState(false);
-  const [drawMode, setDrawMode] = useState(false);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(BUILDING_TEMPLATES[0]?.id ?? "");
+  const [topPopup, setTopPopup] = useState<TopPopup | null>(null);
   const [showResultsPanel, setShowResultsPanel] = useState(false);
   const [polygonBuildings, setPolygonBuildings] = useState<Map<string, GeoJSON.Feature>>(new Map());
-  const [modelLengthScale, setModelLengthScale] = useState(DEFAULT_MODEL_SCALE_PERCENT);
-  const [modelWidthScale, setModelWidthScale] = useState(DEFAULT_MODEL_SCALE_PERCENT);
-  const [modelHeightScale, setModelHeightScale] = useState(DEFAULT_MODEL_SCALE_PERCENT);
-  const [modelRotationDeg, setModelRotationDeg] = useState(DEFAULT_MODEL_ROTATION_DEG);
-  const [rectFirstCorner, setRectFirstCorner] = useState<[number, number] | null>(null);
-
-  useEffect(() => {
-    buildingModeRef.current = buildingMode;
-    const map = mapRef.current;
-    if (!map) {
-      return;
-    }
-    if (buildingMode) {
-      map.dragPan.disable();
-      map.doubleClickZoom.disable();
-      map.getCanvas().style.cursor = "crosshair";
-      setStatusText("Build mode enabled. Click and drag to add a building.");
-    } else {
-      map.dragPan.enable();
-      map.doubleClickZoom.enable();
-      map.getCanvas().style.cursor = "";
-      rectangleDragActiveRef.current = false;
-      rectangleDragStartRef.current = null;
-      rectangleDragCurrentRef.current = null;
-      rectFirstCornerRef.current = null;
-      setRectFirstCorner(null);
-      const previewSource = map.getSource(RECTANGLE_PREVIEW_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-      if (previewSource) {
-        previewSource.setData({
-          type: "FeatureCollection",
-          features: [],
-        });
-      }
-    }
-  }, [buildingMode]);
-
-  useEffect(() => {
-    modelLengthScaleRef.current = modelLengthScale;
-  }, [modelLengthScale]);
-
-  useEffect(() => {
-    modelWidthScaleRef.current = modelWidthScale;
-  }, [modelWidthScale]);
-
-  useEffect(() => {
-    modelHeightScaleRef.current = modelHeightScale;
-  }, [modelHeightScale]);
-
-  useEffect(() => {
-    modelRotationDegRef.current = modelRotationDeg;
-  }, [modelRotationDeg]);
-
-  useEffect(() => {
-    drawModeRef.current = drawMode;
-  }, [drawMode]);
 
   useEffect(() => {
     selectedPolygonBuildingIdRef.current = selectedPolygonBuildingId;
@@ -1328,8 +1331,19 @@ export default function App() {
   }, [selectedModelType]);
 
   useEffect(() => {
-    rectFirstCornerRef.current = rectFirstCorner;
-  }, [rectFirstCorner]);
+    selectedTemplateIdRef.current = selectedTemplateId;
+  }, [selectedTemplateId]);
+
+  const showTopPopup = useCallback((message: string, kind: TopPopup["kind"] = "warning") => {
+    setTopPopup({ message, kind });
+    if (topPopupTimerRef.current !== null) {
+      window.clearTimeout(topPopupTimerRef.current);
+    }
+    topPopupTimerRef.current = window.setTimeout(() => {
+      setTopPopup(null);
+      topPopupTimerRef.current = null;
+    }, 2600);
+  }, []);
 
   const refreshCustomBuildings = useCallback(async () => {
     const map = mapRef.current;
@@ -1444,12 +1458,33 @@ export default function App() {
     [ensurePolygonBuildingsLayer],
   );
 
-  const updateScenegraphOverlay = useCallback((buildings: Map<string, GeoJSON.Feature>) => {
+  const updateScenegraphOverlay = useCallback((
+    buildings: Map<string, GeoJSON.Feature>,
+    previewFeature: GeoJSON.Feature<GeoJSON.Polygon> | null = dragPreviewFeatureRef.current,
+  ) => {
     const overlay = deckOverlayRef.current;
     if (!overlay) {
       return;
     }
     const instances = buildScenegraphInstances(buildings);
+    if (previewFeature) {
+      const previewProperties = asPropertiesRecord(previewFeature.properties);
+      const previewMap = new Map<string, GeoJSON.Feature>();
+      previewMap.set("__preview__", {
+        ...previewFeature,
+        id: "__preview__",
+        properties: {
+          ...previewProperties,
+          id: "__preview__",
+          selected: false,
+        },
+      });
+      const previewInstances = buildScenegraphInstances(previewMap).map((instance) => ({
+        ...instance,
+        id: `preview-${instance.id}`,
+      }));
+      instances.push(...previewInstances);
+    }
     const layers = BUILDING_MODEL_OPTIONS.map((option) => {
       const layerData = instances.filter((instance) => instance.modelType === option.id);
       return new ScenegraphLayer<ScenegraphBuildingInstance>({
@@ -1484,8 +1519,13 @@ export default function App() {
         type: "fill",
         source: RECTANGLE_PREVIEW_SOURCE_ID,
         paint: {
-          "fill-color": "#f59e0b",
-          "fill-opacity": 0.16,
+          "fill-color": [
+            "case",
+            ["==", ["coalesce", ["get", "overlap"], false], true],
+            "#dc2626",
+            "#16a34a",
+          ],
+          "fill-opacity": 0.2,
         },
       });
     }
@@ -1496,7 +1536,12 @@ export default function App() {
         type: "line",
         source: RECTANGLE_PREVIEW_SOURCE_ID,
         paint: {
-          "line-color": "#f59e0b",
+          "line-color": [
+            "case",
+            ["==", ["coalesce", ["get", "overlap"], false], true],
+            "#ef4444",
+            "#22c55e",
+          ],
           "line-width": 2,
           "line-dasharray": [2, 2],
         },
@@ -1505,36 +1550,46 @@ export default function App() {
   }, []);
 
   const updateRectanglePreview = useCallback(
-    (map: maplibregl.Map, start: [number, number], end: [number, number], height: number) => {
+    (
+      map: maplibregl.Map,
+      previewFeature: GeoJSON.Feature<GeoJSON.Polygon>,
+      overlapsExisting: boolean,
+    ) => {
       ensureRectanglePreviewLayer(map);
       const source = map.getSource(RECTANGLE_PREVIEW_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
       if (!source) {
         return;
       }
-      const rectangleCoords = rectangleCoordinatesScreenAligned(map, start, end);
+      const properties = asPropertiesRecord(previewFeature.properties);
       source.setData({
         type: "FeatureCollection",
         features: [
-          createRectangleFeature(
-            "rectangle-preview",
-            start,
-            end,
-            height,
-            selectedModelTypeRef.current,
-            scalePercentToFactor(modelLengthScaleRef.current),
-            scalePercentToFactor(modelWidthScaleRef.current),
-            scalePercentToFactor(modelHeightScaleRef.current),
-            rotationDegreesFromString(modelRotationDegRef.current),
-            false,
-            rectangleCoords,
-          ),
+          {
+            ...previewFeature,
+            id: "rectangle-preview",
+            properties: {
+              ...properties,
+              overlap: overlapsExisting,
+              selected: false,
+            },
+          },
         ],
       });
+      dragPreviewFeatureRef.current = previewFeature;
+      updateScenegraphOverlay(polygonBuildingsRef.current, previewFeature);
+      try {
+        map.moveLayer(RECTANGLE_PREVIEW_FILL_LAYER_ID);
+        map.moveLayer(RECTANGLE_PREVIEW_LINE_LAYER_ID);
+      } catch {
+        // no-op
+      }
     },
-    [ensureRectanglePreviewLayer],
+    [ensureRectanglePreviewLayer, updateScenegraphOverlay],
   );
 
   const clearRectanglePreview = useCallback((map: maplibregl.Map) => {
+    dragPreviewFeatureRef.current = null;
+    updateScenegraphOverlay(polygonBuildingsRef.current, null);
     const source = map.getSource(RECTANGLE_PREVIEW_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
     if (!source) {
       return;
@@ -1543,7 +1598,7 @@ export default function App() {
       type: "FeatureCollection",
       features: [],
     });
-  }, []);
+  }, [updateScenegraphOverlay]);
 
   const ensureTrafficParticleLayer = useCallback((map: maplibregl.Map) => {
     if (!map.getSource(TRAFFIC_PARTICLE_SOURCE_ID)) {
@@ -1671,10 +1726,6 @@ export default function App() {
 
   const setPolygonBuildingSelection = useCallback(
     (map: maplibregl.Map, nextSelectedId: string | null) => {
-      let selectedScaleLength: number | null = null;
-      let selectedScaleWidth: number | null = null;
-      let selectedScaleHeight: number | null = null;
-      let selectedRotationDeg: number | null = null;
       let selectedModel: BuildingModelType | null = null;
       let resolvedSelectedId: string | null = nextSelectedId;
       setPolygonBuildings((prev) => {
@@ -1686,10 +1737,6 @@ export default function App() {
           const properties = asPropertiesRecord(feature.properties);
           const isSelected = id === resolvedSelectedId;
           if (isSelected) {
-            selectedScaleLength = readFeatureScaleFactor(properties, "scaleLength");
-            selectedScaleWidth = readFeatureScaleFactor(properties, "scaleWidth");
-            selectedScaleHeight = readFeatureScaleFactor(properties, "scaleHeight");
-            selectedRotationDeg = readFeatureRotationDeg(properties);
             selectedModel = asBuildingModelType(properties.modelType) ?? "building";
           }
           next.set(id, {
@@ -1706,26 +1753,13 @@ export default function App() {
         return next;
       });
       setSelectedPolygonBuildingId(resolvedSelectedId);
-      if (selectedScaleLength !== null) {
-        setModelLengthScale(factorToScalePercentString(selectedScaleLength));
-      }
-      if (selectedScaleWidth !== null) {
-        setModelWidthScale(factorToScalePercentString(selectedScaleWidth));
-      }
-      if (selectedScaleHeight !== null) {
-        setModelHeightScale(factorToScalePercentString(selectedScaleHeight));
-      }
       if (selectedModel) {
         setSelectedModelType(selectedModel);
-      }
-      if (selectedRotationDeg !== null) {
-        setModelRotationDeg(String(Math.round(selectedRotationDeg)));
       }
       if (resolvedSelectedId) {
         const selectedModelOption = getBuildingModelOption(selectedModel ?? "building");
         console.log("[BUILDING SELECT] Selected building", {
           id: resolvedSelectedId,
-          rotationDeg: selectedRotationDeg ?? 0,
           modelType: selectedModelOption.id,
           modelLabel: selectedModelOption.label,
           modelUrl: selectedModelOption.modelUrl,
@@ -1739,28 +1773,13 @@ export default function App() {
 
   const addPolygonBuilding = useCallback(
     (map: maplibregl.Map, feature: GeoJSON.Feature) => {
-      const buildingId = extractBuildingId(feature) ?? `rect-${Date.now()}`;
+      const buildingId = extractBuildingId(feature) ?? `palette-${Date.now()}`;
       const rawProperties = asPropertiesRecord(feature.properties);
       const modelType = asBuildingModelType(rawProperties.modelType) ?? selectedModelTypeRef.current;
-      const scaleLength = readFeatureScaleFactorOrDefault(
-        rawProperties,
-        "scaleLength",
-        scalePercentToFactor(modelLengthScaleRef.current),
-      );
-      const scaleWidth = readFeatureScaleFactorOrDefault(
-        rawProperties,
-        "scaleWidth",
-        scalePercentToFactor(modelWidthScaleRef.current),
-      );
-      const scaleHeight = readFeatureScaleFactorOrDefault(
-        rawProperties,
-        "scaleHeight",
-        scalePercentToFactor(modelHeightScaleRef.current),
-      );
-      const rotationDeg = readFeatureRotationDegOrDefault(
-        rawProperties,
-        rotationDegreesFromString(modelRotationDegRef.current),
-      );
+      const scaleLength = readFeatureScaleFactorOrDefault(rawProperties, "scaleLength", 1);
+      const scaleWidth = readFeatureScaleFactorOrDefault(rawProperties, "scaleWidth", 1);
+      const scaleHeight = readFeatureScaleFactorOrDefault(rawProperties, "scaleHeight", 1);
+      const rotationDeg = readFeatureRotationDegOrDefault(rawProperties, 0);
       const heightValue = Math.max(
         1,
         Number.parseFloat(String(rawProperties.height ?? BASE_BUILDING_HEIGHT_M * scaleHeight)) ||
@@ -1787,7 +1806,7 @@ export default function App() {
             ...rawProperties,
             id: buildingId,
             height: heightValue,
-            type: rawProperties.type ?? "rectangle-building",
+            type: rawProperties.type ?? "palette-building",
             baseHeight: rawProperties.baseHeight ?? 0,
             modelType,
             scaleLength,
@@ -1805,10 +1824,6 @@ export default function App() {
       });
 
       setSelectedPolygonBuildingId(buildingId);
-      setModelLengthScale(factorToScalePercentString(scaleLength));
-      setModelWidthScale(factorToScalePercentString(scaleWidth));
-      setModelHeightScale(factorToScalePercentString(scaleHeight));
-      setModelRotationDeg(String(Math.round(rotationDeg)));
       setSelectedModelType(modelType);
       const modelOption = getBuildingModelOption(modelType);
       console.log("[BUILDING ADD] Added building", {
@@ -1821,8 +1836,66 @@ export default function App() {
         modelLabel: modelOption.label,
         modelUrl: modelOption.modelUrl,
       });
+      return buildingId;
     },
     [updatePolygonBuildingsSource, updateScenegraphOverlay],
+  );
+
+  const evaluateTemplatePlacement = useCallback(
+    (
+      map: maplibregl.Map,
+      center: [number, number],
+      template: BuildingTemplate,
+      options?: PlacementCheckOptions,
+    ): PlacementCheckResult => {
+      const snappedRotationDeg = snapToRoadOrientation(center, roadsRef.current) ?? 0;
+      const rotationDeg = normalizeRotationDegrees(
+        snappedRotationDeg + (options?.rotationOffsetDeg ?? 0),
+      );
+      const coordinates = rectangleCoordinatesFromCenter(
+        center,
+        template.widthM,
+        template.depthM,
+        rotationDeg,
+      );
+      const modelType = template.modelType ?? selectedModelTypeRef.current;
+      const candidate = createPlacementFeature(
+        `palette-preview-${Date.now()}`,
+        coordinates,
+        template.defaultHeightM,
+        modelType,
+        rotationDeg,
+        false,
+      );
+
+      const overlapsUser = overlapsUserBuildings(candidate, polygonBuildingsRef.current);
+      const candidateRings = extractPolygonRings(candidate);
+      const roadPlacementAllowed = modelType === "construction-sign";
+      const overlapsRoad =
+        !roadPlacementAllowed && roadsRef.current && candidateRings.length > 0
+          ? detectRoadClosuresFromBuildingRings(
+              roadsRef.current,
+              candidateRings,
+              roadFeatureBBoxesRef.current,
+            ).size > 0
+          : false;
+      const overlapsBasemap =
+        options?.includeBasemap === false
+          ? false
+          : overlapsBasemapBuildings(map, candidate, [
+              POLYGON_BUILDINGS_LAYER_ID,
+              POLYGON_BUILDINGS_OUTLINE_LAYER_ID,
+              RECTANGLE_PREVIEW_FILL_LAYER_ID,
+              RECTANGLE_PREVIEW_LINE_LAYER_ID,
+            ]);
+      return {
+        feature: candidate,
+        overlapsUser,
+        overlapsRoad,
+        overlapsBasemap,
+      };
+    },
+    [],
   );
 
   const collectBuildingRings = useCallback((): Array<[number, number][]> => {
@@ -1896,16 +1969,16 @@ export default function App() {
   );
 
   const runSimulation = useCallback(() => {
-    console.log("🔄 [RECOMPUTE] Starting simulation...");
+    console.log("[RECOMPUTE] Starting simulation...");
     const map = mapRef.current;
     const roads = roadsRef.current;
     const graph = graphRef.current;
     if (!map || !roads || !graph) {
-      console.error("❌ [RECOMPUTE] Missing map, roads, or graph");
+      console.error("[RECOMPUTE] Missing map, roads, or graph");
       return;
     }
 
-    console.log("📊 [RECOMPUTE] Network stats:", {
+    console.log("[RECOMPUTE] Network stats:", {
       nodes: graph.nodes.size,
       edges: graph.edges.length,
       trips: odPairsRef.current.length,
@@ -1964,7 +2037,7 @@ export default function App() {
 
     setStats(newStats);
 
-    console.log("✅ [RECOMPUTE] Simulation complete:", {
+    console.log("[RECOMPUTE] Simulation complete:", {
       runtime: `${runtimeMs}ms`,
       closedSegments: effectiveClosedFeatures.size,
       manualClosed: manualClosedCount,
@@ -2107,32 +2180,7 @@ export default function App() {
     deckOverlayRef.current = deckOverlay;
     map.addControl(deckOverlay);
 
-    const { detach } = attachDraw(map);
-
-    const ensureUserSourceAndLayer = () => {
-      if (!map.getSource("user-shape")) {
-        map.addSource("user-shape", {
-          type: "geojson",
-          data: { type: "FeatureCollection", features: [] },
-        });
-      }
-      if (!map.getLayer("user-shape-extrude")) {
-        map.addLayer({
-          id: "user-shape-extrude",
-          type: "fill-extrusion",
-          source: "user-shape",
-          paint: {
-            "fill-extrusion-color": "#ff7e5f",
-            "fill-extrusion-height": ["coalesce", ["get", "height"], 40],
-            "fill-extrusion-base": 0,
-            "fill-extrusion-opacity": 0.8,
-          },
-        });
-      }
-    };
-
     const handleStyleLoad = () => {
-      ensureUserSourceAndLayer();
       ensurePolygonBuildingsLayer(map);
       ensureRectanglePreviewLayer(map);
       updatePolygonBuildingsSource(map, polygonBuildingsRef.current);
@@ -2187,146 +2235,6 @@ export default function App() {
         setStatusText(`Road load failed: ${message}`);
       });
 
-      // Initialize Draw Polygon control (positioned below navigation controls on left)
-      const drawControl = new DrawPolygonControl((active) => {
-        console.log(`✏️ [DRAW POLYGON] Mode ${active ? "enabled" : "disabled"}`);
-        setDrawMode(active);
-        if (active) {
-          setBuildingMode(false);
-          rectangleDragActiveRef.current = false;
-          rectangleDragStartRef.current = null;
-          rectangleDragCurrentRef.current = null;
-          rectFirstCornerRef.current = null;
-          setRectFirstCorner(null);
-          clearRectanglePreview(map);
-        }
-      });
-    
-      drawControlRef.current = drawControl;
-
-      // Handle polygon draw events - convert to 3D buildings
-      const draw = drawControl.getDraw();
-      const handlePolygonCreate = (e: any) => {
-        console.log("🏗️ [POLYGON DRAW] Polygon created, converting to 3D building...", e);
-        const feature = e.features[0];
-        if (feature && feature.geometry.type === "Polygon") {
-          const buildingId = feature.id || `polygon-${Date.now()}`;
-          const buildingHeight = feature.properties?.height ?? 40;
-          const buildingFeature: GeoJSON.Feature = {
-            ...feature,
-            id: buildingId,
-            properties: {
-              ...feature.properties,
-              height: buildingHeight,
-              type: "polygon-building",
-              baseHeight: 0,
-            },
-          };
-
-          addPolygonBuilding(map, buildingFeature);
-          scheduleSimulation(0);
-
-          if (draw) {
-            draw.delete(feature.id);
-          }
-          console.log(`✅ [POLYGON DRAW] Building created with height ${buildingHeight}m`);
-        }
-      };
-
-      const handlePolygonUpdate = (e: any) => {
-        console.log("🔄 [POLYGON DRAW] Polygon updated", e);
-      };
-
-      const handlePolygonDelete = (e: any) => {
-        console.log("🗑️ [POLYGON DRAW] Polygon deleted", e);
-        const removedIds = new Set<string>(e.features.map((feature: any) => String(feature.id)));
-        setPolygonBuildings((prev) => {
-          const next = new Map<string, GeoJSON.Feature>(prev);
-          removedIds.forEach((featureId) => {
-            if (next.has(featureId)) {
-              console.log("[BUILDING DELETE] Removed polygon building", { id: featureId });
-            }
-            next.delete(featureId);
-          });
-          polygonBuildingsRef.current = next;
-          updatePolygonBuildingsSource(map, next);
-          updateScenegraphOverlay(next);
-          return next;
-        });
-        const selectedId = selectedPolygonBuildingIdRef.current;
-        if (selectedId && removedIds.has(selectedId)) {
-          selectedPolygonBuildingIdRef.current = null;
-          setSelectedPolygonBuildingId(null);
-        }
-        scheduleSimulation(0);
-      };
-
-      if (draw) {
-        map.on("draw.create", handlePolygonCreate);
-        map.on("draw.update", handlePolygonUpdate);
-        map.on("draw.delete", handlePolygonDelete);
-      }
-
-      // Store handlers for cleanup
-      (map as any)._polygonHandlers = { create: handlePolygonCreate, update: handlePolygonUpdate, delete: handlePolygonDelete };
-    };
-
-    const handleMapMouseDown = (event: maplibregl.MapMouseEvent) => {
-      if (!buildingModeRef.current || drawModeRef.current) {
-        return;
-      }
-      const dragStart: [number, number] = [event.lngLat.lng, event.lngLat.lat];
-      rectangleDragActiveRef.current = true;
-      rectangleDragStartRef.current = dragStart;
-      rectangleDragCurrentRef.current = dragStart;
-      rectFirstCornerRef.current = dragStart;
-      setRectFirstCorner(dragStart);
-      const heightValue = Math.max(1, BASE_BUILDING_HEIGHT_M * scalePercentToFactor(modelHeightScaleRef.current));
-      updateRectanglePreview(map, dragStart, dragStart, heightValue);
-      setStatusText("Drag to define building footprint.");
-    };
-
-    const handleMapMouseUp = (event: maplibregl.MapMouseEvent) => {
-      if (!rectangleDragActiveRef.current) {
-        return;
-      }
-      rectangleDragActiveRef.current = false;
-      const dragStart = rectangleDragStartRef.current;
-      rectangleDragStartRef.current = null;
-      rectangleDragCurrentRef.current = null;
-      rectFirstCornerRef.current = null;
-      setRectFirstCorner(null);
-      clearRectanglePreview(map);
-      if (!dragStart) {
-        return;
-      }
-
-      const dragEnd: [number, number] = [event.lngLat.lng, event.lngLat.lat];
-      if (rectangleAreaTooSmallScreen(map, dragStart, dragEnd)) {
-        setStatusText("Building not added. Drag a larger rectangle.");
-        return;
-      }
-
-      const scaleHeight = scalePercentToFactor(modelHeightScaleRef.current);
-      const heightValue = Math.max(1, BASE_BUILDING_HEIGHT_M * scaleHeight);
-      const buildingId = `rect-${Date.now()}`;
-      const rectangleCoords = rectangleCoordinatesScreenAligned(map, dragStart, dragEnd);
-      const buildingFeature = createRectangleFeature(
-        buildingId,
-        dragStart,
-        dragEnd,
-        heightValue,
-        selectedModelTypeRef.current,
-        scalePercentToFactor(modelLengthScaleRef.current),
-        scalePercentToFactor(modelWidthScaleRef.current),
-        scaleHeight,
-        rotationDegreesFromString(modelRotationDegRef.current),
-        true,
-        rectangleCoords,
-      );
-      addPolygonBuilding(map, buildingFeature);
-      scheduleSimulation(0);
-      setStatusText(`Building created.`);
     };
 
     const handleMapClick = (event: maplibregl.MapMouseEvent) => {
@@ -2341,10 +2249,6 @@ export default function App() {
           }
           return;
         }
-      }
-
-      if (buildingModeRef.current || drawModeRef.current) {
-        return;
       }
 
       if (selectedPolygonBuildingIdRef.current) {
@@ -2401,23 +2305,6 @@ export default function App() {
         lat: Number(event.lngLat.lat.toFixed(6)),
       });
 
-      if (rectangleDragActiveRef.current) {
-        const dragStart = rectangleDragStartRef.current;
-        if (dragStart) {
-          const dragCurrent: [number, number] = [event.lngLat.lng, event.lngLat.lat];
-          rectangleDragCurrentRef.current = dragCurrent;
-          const heightValue = Math.max(1, BASE_BUILDING_HEIGHT_M * scalePercentToFactor(modelHeightScaleRef.current));
-          updateRectanglePreview(map, dragStart, dragCurrent, heightValue);
-        }
-        map.getCanvas().style.cursor = "crosshair";
-        return;
-      }
-
-      if (buildingModeRef.current && !drawModeRef.current) {
-        map.getCanvas().style.cursor = "crosshair";
-        return;
-      }
-
       if (map.getLayer(POLYGON_BUILDINGS_LAYER_ID)) {
         const buildingFeatures = map.queryRenderedFeatures(event.point, {
           layers: [POLYGON_BUILDINGS_LAYER_ID],
@@ -2440,12 +2327,10 @@ export default function App() {
 
     const handleMouseLeave = () => {
       setCursorCoordinates(null);
-      map.getCanvas().style.cursor = buildingModeRef.current ? "crosshair" : "";
+      map.getCanvas().style.cursor = "";
     };
 
     map.on("style.load", handleStyleLoad);
-    map.on("mousedown", handleMapMouseDown);
-    map.on("mouseup", handleMapMouseUp);
     map.on("click", handleMapClick);
     map.on("mousemove", handleMouseMove);
     map.on("mouseleave", handleMouseLeave);
@@ -2460,23 +2345,7 @@ export default function App() {
       trafficEdgeMetricsRef.current = new Map();
       trafficSimulationTimeRef.current = 0;
       nodeNextReleaseRef.current = new Map();
-      if (drawControlRef.current) {
-        const handlers = (map as any)._polygonHandlers;
-        if (handlers) {
-          map.off("draw.create", handlers.create);
-          map.off("draw.update", handlers.update);
-          map.off("draw.delete", handlers.delete);
-        }
-        map.removeControl(drawControlRef.current);
-      }
-      try {
-        detach();
-      } catch {
-        // no-op
-      }
       map.off("style.load", handleStyleLoad);
-      map.off("mousedown", handleMapMouseDown);
-      map.off("mouseup", handleMapMouseUp);
       map.off("click", handleMapClick);
       map.off("mousemove", handleMouseMove);
       map.off("mouseleave", handleMouseLeave);
@@ -2489,9 +2358,7 @@ export default function App() {
       mapRef.current = null;
     };
   }, [
-    addPolygonBuilding,
     bringTrafficParticlesToFront,
-    clearRectanglePreview,
     ensureRectanglePreviewLayer,
     ensurePolygonBuildingsLayer,
     ensureTrafficParticleLayer,
@@ -2501,157 +2368,279 @@ export default function App() {
     scheduleSimulation,
     setPolygonBuildingSelection,
     stopTrafficParticleAnimation,
-    updateRectanglePreview,
     updatePolygonBuildingsSource,
     updateScenegraphOverlay,
   ]);
 
   const handleResetClosures = useCallback(() => {
-    console.log("🔄 [RESET CLOSURES] Clearing all road closures...");
+    console.log("[RESET CLOSURES] Clearing all road closures...");
     if (manualClosedFeaturesRef.current.size === 0) {
-      console.log("ℹ️ [RESET CLOSURES] No manual closures to reset");
+      console.log("[RESET CLOSURES] No manual closures to reset");
       scheduleSimulation(0);
       return;
     }
     const closedCount = manualClosedFeaturesRef.current.size;
     manualClosedFeaturesRef.current.clear();
-    console.log(`✅ [RESET CLOSURES] Cleared ${closedCount} manual road closures`);
+    console.log(`[RESET CLOSURES] Cleared ${closedCount} manual road closures`);
     scheduleSimulation(0);
   }, [scheduleSimulation]);
 
   const handleManualRecompute = useCallback(() => {
-    console.log("🔄 [MANUAL RECOMPUTE] User triggered recompute");
+    console.log("[MANUAL RECOMPUTE] User triggered recompute");
     scheduleSimulation(0);
   }, [scheduleSimulation]);
 
-  // Building placement handlers
-  const handleToggleBuildingMode = useCallback(() => {
-    console.log("[BUILD MODE] Toggling build mode");
-    setBuildingMode((prev) => {
-      const newMode = !prev;
-      if (newMode) {
-        console.log("[BUILD MODE] Enabled");
-        setDrawMode(false);
-        drawControlRef.current?.setActive(false);
-      } else {
-        console.log("[BUILD MODE] Disabled");
+  const resolveTemplateFromDrag = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>): BuildingTemplate => {
+      const dragPayload = event.dataTransfer.getData(BUILDING_TEMPLATE_MIME);
+      if (dragPayload) {
+        try {
+          const parsed = JSON.parse(dragPayload) as BuildingTemplate;
+          if (parsed && typeof parsed.id === "string") {
+            const template = getBuildingTemplate(parsed.id);
+            draggingTemplateRef.current = template;
+            return template;
+          }
+        } catch {
+          // no-op
+        }
       }
-      return newMode;
-    });
+      const dragged = draggingTemplateRef.current;
+      if (dragged) {
+        return dragged;
+      }
+      return getBuildingTemplate(selectedTemplateIdRef.current);
+    },
+    [],
+  );
+
+  const getDropCenter = useCallback((event: ReactDragEvent<HTMLDivElement>): [number, number] | null => {
+    const map = mapRef.current;
+    if (!map) {
+      return null;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const point: [number, number] = [event.clientX - bounds.left, event.clientY - bounds.top];
+    const lngLat = map.unproject(point);
+    return [lngLat.lng, lngLat.lat];
   }, []);
 
-  const handleDeleteSelectedBuilding = useCallback(() => {
-    const selectedId = selectedPolygonBuildingIdRef.current;
-    const map = mapRef.current;
-    if (!selectedId || !map) {
-      return;
+  const handleTemplateDragStart = useCallback((template: BuildingTemplate) => {
+    setSelectedTemplateId(template.id);
+    setSelectedModelType(template.modelType ?? "building");
+    draggingTemplateRef.current = template;
+    dragRotationOffsetDegRef.current = 0;
+    setStatusText(`Drag ${template.label} onto the map.`);
+  }, []);
+
+  const cancelDragPreviewFrame = useCallback(() => {
+    if (dragPreviewFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragPreviewFrameRef.current);
+      dragPreviewFrameRef.current = null;
     }
+    dragPreviewPendingRef.current = null;
+  }, []);
 
-    setPolygonBuildings((prev) => {
-      if (!prev.has(selectedId)) {
-        return prev;
-      }
-      const next = new Map(prev);
-      next.delete(selectedId);
-      polygonBuildingsRef.current = next;
-      updatePolygonBuildingsSource(map, next);
-      updateScenegraphOverlay(next);
-      return next;
-    });
+  const handleTemplateDragEnd = useCallback(() => {
+    draggingTemplateRef.current = null;
+    dragPreviewLatestRef.current = null;
+    dragRotationOffsetDegRef.current = 0;
+    cancelDragPreviewFrame();
+    const map = mapRef.current;
+    if (map) {
+      clearRectanglePreview(map);
+    }
+  }, [cancelDragPreviewFrame, clearRectanglePreview]);
 
-    selectedPolygonBuildingIdRef.current = null;
-    setSelectedPolygonBuildingId(null);
-    console.log("[BUILDING DELETE] Deleted selected building", { id: selectedId });
-    scheduleSimulation(0);
-    setStatusText("Selected building deleted.");
-  }, [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay]);
-
-  const handleModelScaleChange = useCallback(
-    (dimension: "length" | "width" | "height", value: string) => {
-      if (dimension === "length") {
-        setModelLengthScale(value);
-      } else if (dimension === "width") {
-        setModelWidthScale(value);
-      } else {
-        setModelHeightScale(value);
-      }
-
-      const nextLengthScale =
-        dimension === "length"
-          ? scalePercentToFactor(value)
-          : scalePercentToFactor(modelLengthScaleRef.current);
-      const nextWidthScale =
-        dimension === "width"
-          ? scalePercentToFactor(value)
-          : scalePercentToFactor(modelWidthScaleRef.current);
-      const nextHeightScale =
-        dimension === "height"
-          ? scalePercentToFactor(value)
-          : scalePercentToFactor(modelHeightScaleRef.current);
-
-      const map = mapRef.current;
-      const selectedId = selectedPolygonBuildingIdRef.current;
-
-      if (map && rectangleDragActiveRef.current) {
-        const dragStart = rectangleDragStartRef.current;
-        const dragCurrent = rectangleDragCurrentRef.current;
-        if (dragStart && dragCurrent) {
-          const previewHeight = Math.max(1, BASE_BUILDING_HEIGHT_M * nextHeightScale);
-          updateRectanglePreview(map, dragStart, dragCurrent, previewHeight);
-        }
-      }
-
-      if (!map || !selectedId) {
+  const renderDragPreviewAt = useCallback(
+    (center: [number, number], template: BuildingTemplate) => {
+      const activeMap = mapRef.current;
+      if (!activeMap) {
         return;
       }
+      const check = evaluateTemplatePlacement(activeMap, center, template, {
+        includeBasemap: false,
+        rotationOffsetDeg: dragRotationOffsetDegRef.current,
+      });
+      updateRectanglePreview(activeMap, check.feature, check.overlapsUser || check.overlapsRoad);
+    },
+    [evaluateTemplatePlacement, updateRectanglePreview],
+  );
 
-      const nextHeight = Math.max(1, BASE_BUILDING_HEIGHT_M * nextHeightScale);
+  const handleMapDragOver = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      const map = mapRef.current;
+      const center = getDropCenter(event);
+      if (!map || !center) {
+        return;
+      }
+      const template = resolveTemplateFromDrag(event);
+      dragPreviewLatestRef.current = { center, template };
+      dragPreviewPendingRef.current = { center, template };
+      if (dragPreviewFrameRef.current !== null) {
+        return;
+      }
+      dragPreviewFrameRef.current = window.requestAnimationFrame(() => {
+        dragPreviewFrameRef.current = null;
+        const pending = dragPreviewPendingRef.current;
+        dragPreviewPendingRef.current = null;
+        const activeMap = mapRef.current;
+        if (!activeMap || !pending) {
+          return;
+        }
+        renderDragPreviewAt(pending.center, pending.template);
+      });
+    },
+    [getDropCenter, renderDragPreviewAt, resolveTemplateFromDrag],
+  );
 
+  const removePolygonBuildingById = useCallback(
+    (buildingId: string, statusMessage?: string): boolean => {
+      const map = mapRef.current;
+      if (!map) {
+        return false;
+      }
+
+      let removed = false;
+      let removedSelected = false;
       setPolygonBuildings((prev) => {
-        const selectedFeature = prev.get(selectedId);
-        if (!selectedFeature) {
+        if (!prev.has(buildingId)) {
           return prev;
         }
+        removed = true;
+        removedSelected = selectedPolygonBuildingIdRef.current === buildingId;
         const next = new Map(prev);
-        const properties = asPropertiesRecord(selectedFeature.properties);
-        next.set(selectedId, {
-          ...selectedFeature,
-          properties: {
-            ...properties,
-            scaleLength: nextLengthScale,
-            scaleWidth: nextWidthScale,
-            scaleHeight: nextHeightScale,
-            height: nextHeight,
-            selected: true,
-          },
-        });
+        next.delete(buildingId);
         polygonBuildingsRef.current = next;
         updatePolygonBuildingsSource(map, next);
         updateScenegraphOverlay(next);
         return next;
       });
 
-      console.log("[BUILDING UPDATE] Updated selected building scale", {
-        id: selectedId,
-        lengthScale: nextLengthScale,
-        widthScale: nextWidthScale,
-        heightScale: nextHeightScale,
-      });
-      scheduleSimulation(120);
+      if (removedSelected) {
+        selectedPolygonBuildingIdRef.current = null;
+        setSelectedPolygonBuildingId(null);
+      }
+      if (removed) {
+        scheduleSimulation(0);
+        if (statusMessage) {
+          setStatusText(statusMessage);
+        }
+      }
+      return removed;
     },
-    [scheduleSimulation, updatePolygonBuildingsSource, updateRectanglePreview, updateScenegraphOverlay],
+    [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay],
   );
 
-  const handleModelRotationChange = useCallback((value: string) => {
-    setModelRotationDeg(value);
+  const handleMapDrop = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      cancelDragPreviewFrame();
+      const map = mapRef.current;
+      const center = getDropCenter(event);
+      if (!map || !center) {
+        return;
+      }
+      const template = resolveTemplateFromDrag(event);
+      const check = evaluateTemplatePlacement(map, center, template, {
+        includeBasemap: false,
+        rotationOffsetDeg: dragRotationOffsetDegRef.current,
+      });
+      clearRectanglePreview(map);
+      draggingTemplateRef.current = null;
+      dragPreviewLatestRef.current = null;
+      dragRotationOffsetDegRef.current = 0;
 
+      if (check.overlapsRoad) {
+        showTopPopup("Invalid placement: you cannot place buildings on roads.", "warning");
+        setStatusText("Placement blocked: building footprint intersects a road.");
+        return;
+      }
+
+      if (check.overlapsUser) {
+        showTopPopup("Invalid placement: overlaps an existing placed building.", "warning");
+        setStatusText("Placement blocked: overlaps an existing building.");
+        return;
+      }
+
+      const placedBuildingId = addPolygonBuilding(map, check.feature);
+      setSelectedTemplateId(template.id);
+      setSelectedModelType(template.modelType ?? "building");
+      setStatusText(`Placing ${template.label}... validating overlap.`);
+      scheduleSimulation(120);
+
+      window.setTimeout(() => {
+        const activeMap = mapRef.current;
+        if (!activeMap) {
+          return;
+        }
+        const placedFeature = polygonBuildingsRef.current.get(placedBuildingId);
+        if (!placedFeature || placedFeature.geometry.type !== "Polygon") {
+          return;
+        }
+        const overlapsBasemap = overlapsBasemapBuildings(
+          activeMap,
+          placedFeature as GeoJSON.Feature<GeoJSON.Polygon>,
+          [
+            POLYGON_BUILDINGS_LAYER_ID,
+            POLYGON_BUILDINGS_OUTLINE_LAYER_ID,
+            RECTANGLE_PREVIEW_FILL_LAYER_ID,
+            RECTANGLE_PREVIEW_LINE_LAYER_ID,
+          ],
+        );
+        if (overlapsBasemap) {
+          showTopPopup("Invalid placement: overlaps a basemap building. Placement reverted.", "warning");
+          removePolygonBuildingById(
+            placedBuildingId,
+            "Placement reverted: overlaps an existing basemap building.",
+          );
+          return;
+        }
+        setStatusText(
+          `Placed ${template.label}. Use [ ] or R to rotate selected building, Backspace to delete.`,
+        );
+      }, 0);
+    },
+    [
+      addPolygonBuilding,
+      clearRectanglePreview,
+      evaluateTemplatePlacement,
+      getDropCenter,
+      resolveTemplateFromDrag,
+      scheduleSimulation,
+      cancelDragPreviewFrame,
+      removePolygonBuildingById,
+      showTopPopup,
+    ],
+  );
+
+  useEffect(() => () => {
+    cancelDragPreviewFrame();
+    if (topPopupTimerRef.current !== null) {
+      window.clearTimeout(topPopupTimerRef.current);
+      topPopupTimerRef.current = null;
+    }
+  }, [cancelDragPreviewFrame]);
+
+  const handleDeleteSelectedBuilding = useCallback(() => {
+    const selectedId = selectedPolygonBuildingIdRef.current;
+    if (!selectedId) {
+      return;
+    }
+    if (removePolygonBuildingById(selectedId, "Selected building deleted.")) {
+      console.log("[BUILDING DELETE] Deleted selected building", { id: selectedId });
+    }
+  }, [removePolygonBuildingById]);
+
+  const handleSelectedBuildingHeightChange = useCallback((heightM: number) => {
     const map = mapRef.current;
     const selectedId = selectedPolygonBuildingIdRef.current;
     if (!map || !selectedId) {
       return;
     }
 
-    const nextRotationDeg = rotationDegreesFromString(value);
     setPolygonBuildings((prev) => {
       const selectedFeature = prev.get(selectedId);
       if (!selectedFeature) {
@@ -2663,7 +2652,7 @@ export default function App() {
         ...selectedFeature,
         properties: {
           ...properties,
-          rotationDeg: nextRotationDeg,
+          height: Math.max(1, heightM),
           selected: true,
         },
       });
@@ -2673,11 +2662,43 @@ export default function App() {
       return next;
     });
 
-    console.log("[BUILDING UPDATE] Updated selected building rotation", {
-      id: selectedId,
-      rotationDeg: nextRotationDeg,
+    scheduleSimulation(120);
+  }, [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay]);
+
+  const rotateSelectedBuilding = useCallback((deltaDeg: number) => {
+    const map = mapRef.current;
+    const selectedId = selectedPolygonBuildingIdRef.current;
+    if (!map || !selectedId) {
+      return;
+    }
+
+    setPolygonBuildings((prev) => {
+      const selectedFeature = prev.get(selectedId);
+      if (!selectedFeature || selectedFeature.geometry.type !== "Polygon") {
+        return prev;
+      }
+      const next = new Map(prev);
+      const properties = asPropertiesRecord(selectedFeature.properties);
+      const rotated = transformRotate(selectedFeature as GeoJSON.Feature<GeoJSON.Polygon>, deltaDeg, {
+        pivot: centroid(selectedFeature as GeoJSON.Feature<GeoJSON.Polygon>),
+      }) as GeoJSON.Feature<GeoJSON.Polygon>;
+      next.set(selectedId, {
+        ...rotated,
+        id: selectedId,
+        properties: {
+          ...properties,
+          rotationDeg: normalizeRotationDegrees(readFeatureRotationDeg(properties) + deltaDeg),
+          selected: true,
+        },
+      });
+      polygonBuildingsRef.current = next;
+      updatePolygonBuildingsSource(map, next);
+      updateScenegraphOverlay(next);
+      return next;
     });
-  }, [updatePolygonBuildingsSource, updateScenegraphOverlay]);
+
+    scheduleSimulation(0);
+  }, [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay]);
 
   const handleModelTypeChange = useCallback(
     (modelType: BuildingModelType) => {
@@ -2726,11 +2747,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    const handleBackspaceDelete = (event: KeyboardEvent) => {
-      if (event.key !== "Backspace" || !selectedPolygonBuildingIdRef.current) {
-        return;
-      }
-
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
       if (target instanceof HTMLElement) {
         const tagName = target.tagName;
@@ -2744,19 +2761,77 @@ export default function App() {
         }
       }
 
-      event.preventDefault();
-      handleDeleteSelectedBuilding();
+      if (draggingTemplateRef.current && (event.key === "r" || event.key === "R")) {
+        event.preventDefault();
+        const delta = event.shiftKey ? 45 : 15;
+        dragRotationOffsetDegRef.current = normalizeRotationDegrees(
+          dragRotationOffsetDegRef.current + delta,
+        );
+        const latest = dragPreviewLatestRef.current;
+        if (latest) {
+          renderDragPreviewAt(latest.center, latest.template);
+        }
+        return;
+      }
+
+      if (!selectedPolygonBuildingIdRef.current) {
+        return;
+      }
+
+      if (event.key === "Backspace") {
+        event.preventDefault();
+        handleDeleteSelectedBuilding();
+        return;
+      }
+
+      if (event.key === "r" || event.key === "R") {
+        event.preventDefault();
+        rotateSelectedBuilding(event.shiftKey ? ROTATION_STEP_LARGE_DEG : ROTATION_STEP_DEG);
+        return;
+      }
+
+      if (event.key === "[") {
+        event.preventDefault();
+        rotateSelectedBuilding(-ROTATION_STEP_DEG);
+        return;
+      }
+
+      if (event.key === "]") {
+        event.preventDefault();
+        rotateSelectedBuilding(ROTATION_STEP_DEG);
+      }
     };
 
-    window.addEventListener("keydown", handleBackspaceDelete);
+    window.addEventListener("keydown", handleGlobalKeyDown);
     return () => {
-      window.removeEventListener("keydown", handleBackspaceDelete);
+      window.removeEventListener("keydown", handleGlobalKeyDown);
     };
-  }, [handleDeleteSelectedBuilding]);
+  }, [handleDeleteSelectedBuilding, renderDragPreviewAt, rotateSelectedBuilding]);
+
+  const selectedBuildingFeature =
+    selectedPolygonBuildingId ? polygonBuildings.get(selectedPolygonBuildingId) ?? null : null;
+  const selectedBuildingProperties = asPropertiesRecord(selectedBuildingFeature?.properties);
+  const selectedHeightM = Math.max(
+    1,
+    Number.parseFloat(String(selectedBuildingProperties.height ?? BASE_BUILDING_HEIGHT_M)) ||
+      BASE_BUILDING_HEIGHT_M,
+  );
+  const selectedBuildingModelType =
+    asBuildingModelType(selectedBuildingProperties.modelType) ?? selectedModelType;
 
   return (
     <div className="app-shell">
-      <div ref={mapContainerRef} className="map-container" />
+      <div
+        ref={mapContainerRef}
+        className="map-container"
+        onDragOver={handleMapDragOver}
+        onDrop={handleMapDrop}
+      />
+      {topPopup ? (
+        <div className={`top-popup top-popup-${topPopup.kind}`} role="alert" aria-live="assertive">
+          {topPopup.message}
+        </div>
+      ) : null}
 
       <section className="controls">
         <h1>Toronto Reactive Traffic Heatmap</h1>
@@ -2768,47 +2843,39 @@ export default function App() {
           <button type="button" onClick={handleResetClosures}>
             Reset Closures
           </button>
-          <button
-            type="button"
-            onClick={handleToggleBuildingMode}
-            style={{
-              backgroundColor: buildingMode ? "#28a745" : "#6c757d",
-              color: "white",
-            }}
-          >
-            {buildingMode ? "Switch to Free Move" : "Switch to Build Mode"}
-          </button>
         </div>
         <div className="stats">
           <div style={{ fontSize: "13px", color: "#374151", padding: "8px 0" }}>
-            <strong style={{ color: "#111827" }}>Traffic Status:</strong> {stats.closed} road{stats.closed !== 1 ? 's' : ''} closed · {" "}
+            <strong style={{ color: "#111827" }}>Traffic Status:</strong> {stats.closed} road{stats.closed !== 1 ? 's' : ''} closed -{" "}
             {stats.unreachable > 0 ? (
               <span style={{ color: "#dc2626" }}>{((stats.unreachable / stats.trips) * 100).toFixed(1)}% trips affected</span>
             ) : (
               <span style={{ color: "#10b981" }}>minimal impact</span>
             )}
-            {" "}· {stats.trips} simulated trips
+            {" "} - {stats.trips} simulated trips
           </div>
         </div>
         <p className="hint">
-          {buildingMode
-            ? rectFirstCorner
-              ? "Build mode: drag to finish this building footprint."
-              : "Build mode: click and drag once to create a building footprint."
-            : drawMode
-              ? "Polygon draw mode active."
-              : "Free move mode: click roads to toggle closures and click buildings to select."}
+          Drag from the palette to place buildings. Click roads to toggle closures and click buildings to select.
         </p>
       </section>
 
       <section className="shape-panel">
-        <h2>Add Building</h2>
+        <BuildingPalette
+          templates={BUILDING_TEMPLATES}
+          selectedTemplateId={selectedTemplateId}
+          onSelectTemplate={setSelectedTemplateId}
+          onTemplateDragStart={handleTemplateDragStart}
+          onTemplateDragEnd={handleTemplateDragEnd}
+        />
+        <h2>Selected Building</h2>
         <div className="shape-row">
           <label htmlFor="building-model">3D Model</label>
           <select
             id="building-model"
-            value={selectedModelType}
+            value={selectedBuildingModelType}
             onChange={(e) => handleModelTypeChange(e.target.value as BuildingModelType)}
+            disabled={!selectedPolygonBuildingId}
           >
             {BUILDING_MODEL_OPTIONS.map((option) => (
               <option key={option.id} value={option.id}>
@@ -2818,69 +2885,22 @@ export default function App() {
           </select>
         </div>
         <div className="shape-row">
-          <label htmlFor="shape-length">
-            Length: {scalePercentToFactor(modelLengthScale).toFixed(2)}x
-          </label>
-          <input
-            id="shape-length"
-            type="range"
-            min={MIN_MODEL_SCALE_PERCENT}
-            max={MAX_MODEL_SCALE_PERCENT}
-            step="1"
-            value={clampNumber(Number.parseFloat(modelLengthScale) || 100, MIN_MODEL_SCALE_PERCENT, MAX_MODEL_SCALE_PERCENT)}
-            onChange={(e) => handleModelScaleChange("length", e.target.value)}
-          />
-        </div>
-        <div className="shape-row">
-          <label htmlFor="shape-width">
-            Width: {scalePercentToFactor(modelWidthScale).toFixed(2)}x
-          </label>
-          <input
-            id="shape-width"
-            type="range"
-            min={MIN_MODEL_SCALE_PERCENT}
-            max={MAX_MODEL_SCALE_PERCENT}
-            step="1"
-            value={clampNumber(Number.parseFloat(modelWidthScale) || 100, MIN_MODEL_SCALE_PERCENT, MAX_MODEL_SCALE_PERCENT)}
-            onChange={(e) => handleModelScaleChange("width", e.target.value)}
-          />
-        </div>
-        <div className="shape-row">
-          <label htmlFor="shape-height">
-            Height: {scalePercentToFactor(modelHeightScale).toFixed(2)}x
-          </label>
+          <label htmlFor="shape-height">Height: {selectedHeightM.toFixed(1)}m</label>
           <input
             id="shape-height"
             type="range"
-            min={MIN_MODEL_SCALE_PERCENT}
-            max={MAX_MODEL_SCALE_PERCENT}
+            min={5}
+            max={220}
             step="1"
-            value={clampNumber(Number.parseFloat(modelHeightScale) || 100, MIN_MODEL_SCALE_PERCENT, MAX_MODEL_SCALE_PERCENT)}
-            onChange={(e) => handleModelScaleChange("height", e.target.value)}
-          />
-        </div>
-        <div className="shape-row">
-          <label htmlFor="shape-rotation">
-            Rotation: {Math.round(rotationDegreesFromString(modelRotationDeg))}°
-          </label>
-          <input
-            id="shape-rotation"
-            type="range"
-            min={MIN_MODEL_ROTATION_DEG}
-            max={MAX_MODEL_ROTATION_DEG}
-            step="1"
-            value={clampNumber(
-              Number.parseFloat(modelRotationDeg) || 0,
-              MIN_MODEL_ROTATION_DEG,
-              MAX_MODEL_ROTATION_DEG,
-            )}
-            onChange={(e) => handleModelRotationChange(e.target.value)}
+            value={Math.round(selectedHeightM)}
+            onChange={(e) => handleSelectedBuildingHeightChange(Number(e.target.value))}
+            disabled={!selectedPolygonBuildingId}
           />
         </div>
         <p className="shape-help">
           {selectedPolygonBuildingId
-            ? `Selected: ${selectedPolygonBuildingId} (${getBuildingModelOption(selectedModelType).label})`
-            : `Next model: ${getBuildingModelOption(selectedModelType).label}. Click one building to edit.`}
+            ? `Selected: ${selectedPolygonBuildingId}. Rotate with R, Shift+R, [ or ].`
+            : "Select a building to adjust height or model."}
         </p>
         <button
           type="button"
@@ -2942,3 +2962,4 @@ export default function App() {
     </div>
   );
 }
+
