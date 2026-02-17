@@ -49,6 +49,32 @@ body,
   border: 1px solid #7dd3fc;
 }
 
+.layout-actions {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1100;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 8px;
+}
+
+.layout-actions button {
+  border: 1px solid #1f2937;
+  background: rgba(255, 255, 255, 0.96);
+  color: #1f2937;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.layout-actions button:hover {
+  background: #ffffff;
+}
+
 .controls {
   position: absolute;
   top: 14px;
@@ -248,6 +274,15 @@ body,
 .shape-cancel:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+@media (max-width: 680px) {
+  .layout-actions {
+    top: 10px;
+    width: calc(100% - 24px);
+    max-width: 420px;
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .chip {

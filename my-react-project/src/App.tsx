@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent as ReactChangeEvent,
+  type DragEvent as ReactDragEvent,
+} from "react";
 import maplibregl from "maplibre-gl";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import { ScenegraphLayer } from "@deck.gl/mesh-layers";
@@ -286,6 +293,269 @@ const DEFAULT_STATS: SimulationStats = {
   runtimeMs: 0,
   unreachable: 0,
 };
+
+const LAYOUT_FILE_FORMAT = "toronto-reactive-traffic-layout";
+const LAYOUT_FILE_VERSION = 1;
+const LAYOUT_IMPORT_MAX_BUILDINGS = 1000;
+const LAYOUT_MAX_HEIGHT_M = 1000;
+const LAYOUT_MAX_BASE_HEIGHT_M = 1000;
+
+type LayoutFileBuilding = {
+  id: string;
+  feature: GeoJSON.Feature<GeoJSON.Polygon>;
+};
+
+type LayoutFileV1 = {
+  format: typeof LAYOUT_FILE_FORMAT;
+  version: typeof LAYOUT_FILE_VERSION;
+  exportedAt: string;
+  buildings: LayoutFileBuilding[];
+};
+
+function makeUniqueBuildingId(baseId: string, used: ReadonlySet<string>): string {
+  const trimmed = baseId.trim();
+  const normalized = trimmed.length > 0 ? trimmed : "imported-building";
+  if (!used.has(normalized)) {
+    return normalized;
+  }
+  let suffix = 2;
+  while (used.has(`${normalized}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${normalized}-${suffix}`;
+}
+
+function safeNumberInRange(value: unknown, min: number, max: number): number | null {
+  const parsed = Number.parseFloat(String(value));
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    return null;
+  }
+  return parsed;
+}
+
+function normalizePolygonCoordinates(raw: unknown): GeoJSON.Position[][] | null {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return null;
+  }
+
+  const rings: GeoJSON.Position[][] = [];
+  for (const ringRaw of raw) {
+    if (!Array.isArray(ringRaw) || ringRaw.length < 4) {
+      return null;
+    }
+    const ring: GeoJSON.Position[] = [];
+    for (const coordRaw of ringRaw) {
+      if (!Array.isArray(coordRaw) || coordRaw.length < 2) {
+        return null;
+      }
+      const lng = Number(coordRaw[0]);
+      const lat = Number(coordRaw[1]);
+      if (!Number.isFinite(lng) || !Number.isFinite(lat) || lng < -180 || lng > 180 || lat < -90 || lat > 90) {
+        return null;
+      }
+      ring.push([lng, lat]);
+    }
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) {
+      ring.push([first[0], first[1]]);
+    }
+    rings.push(ring);
+  }
+  return rings;
+}
+
+function parseLayoutFileBuildings(fileContent: string): LayoutFileBuilding[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fileContent);
+  } catch {
+    throw new Error("File is not valid JSON.");
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Layout file must contain a JSON object.");
+  }
+
+  const candidate = parsed as Record<string, unknown>;
+  if (candidate.format !== LAYOUT_FILE_FORMAT) {
+    throw new Error(`Unsupported layout format. Expected "${LAYOUT_FILE_FORMAT}".`);
+  }
+  if (candidate.version !== LAYOUT_FILE_VERSION) {
+    throw new Error(`Unsupported layout version. Expected version ${LAYOUT_FILE_VERSION}.`);
+  }
+  if (typeof candidate.exportedAt !== "string" || candidate.exportedAt.trim().length === 0) {
+    throw new Error("Layout file is missing exportedAt.");
+  }
+  if (!Array.isArray(candidate.buildings)) {
+    throw new Error("Layout file is missing buildings array.");
+  }
+  if (candidate.buildings.length > LAYOUT_IMPORT_MAX_BUILDINGS) {
+    throw new Error(`Layout has too many buildings. Maximum supported is ${LAYOUT_IMPORT_MAX_BUILDINGS}.`);
+  }
+
+  const result: LayoutFileBuilding[] = [];
+  const usedIds = new Set<string>();
+
+  for (let index = 0; index < candidate.buildings.length; index += 1) {
+    const item = candidate.buildings[index];
+    if (!item || typeof item !== "object") {
+      throw new Error(`Building entry ${index + 1} is invalid.`);
+    }
+    const entry = item as Record<string, unknown>;
+    const featureRaw = entry.feature;
+    if (!featureRaw || typeof featureRaw !== "object") {
+      throw new Error(`Building entry ${index + 1} is missing feature.`);
+    }
+    const featureObj = featureRaw as Record<string, unknown>;
+    if (featureObj.type !== "Feature") {
+      throw new Error(`Building entry ${index + 1} has invalid feature type.`);
+    }
+
+    const geometryRaw = featureObj.geometry;
+    if (!geometryRaw || typeof geometryRaw !== "object") {
+      throw new Error(`Building entry ${index + 1} is missing geometry.`);
+    }
+    const geometry = geometryRaw as Record<string, unknown>;
+    if (geometry.type !== "Polygon") {
+      throw new Error(`Building entry ${index + 1} must use Polygon geometry.`);
+    }
+    const coordinates = normalizePolygonCoordinates(geometry.coordinates);
+    if (!coordinates) {
+      throw new Error(`Building entry ${index + 1} has invalid polygon coordinates.`);
+    }
+
+    const propertiesRaw =
+      featureObj.properties && typeof featureObj.properties === "object"
+        ? (featureObj.properties as Record<string, unknown>)
+        : null;
+    if (!propertiesRaw) {
+      throw new Error(`Building entry ${index + 1} is missing feature properties.`);
+    }
+
+    const modelType = asBuildingModelType(propertiesRaw.modelType);
+    if (!modelType) {
+      throw new Error(`Building entry ${index + 1} has invalid modelType.`);
+    }
+
+    const height = safeNumberInRange(propertiesRaw.height, 1, LAYOUT_MAX_HEIGHT_M);
+    if (height === null) {
+      throw new Error(`Building entry ${index + 1} has invalid height.`);
+    }
+
+    const baseHeight = safeNumberInRange(propertiesRaw.baseHeight ?? 0, 0, LAYOUT_MAX_BASE_HEIGHT_M);
+    if (baseHeight === null) {
+      throw new Error(`Building entry ${index + 1} has invalid baseHeight.`);
+    }
+
+    const scaleLength = safeNumberInRange(
+      propertiesRaw.scaleLength,
+      MIN_MODEL_SCALE_PERCENT / 100,
+      MAX_MODEL_SCALE_PERCENT / 100,
+    );
+    const scaleWidth = safeNumberInRange(
+      propertiesRaw.scaleWidth,
+      MIN_MODEL_SCALE_PERCENT / 100,
+      MAX_MODEL_SCALE_PERCENT / 100,
+    );
+    const scaleHeight = safeNumberInRange(
+      propertiesRaw.scaleHeight,
+      MIN_MODEL_SCALE_PERCENT / 100,
+      MAX_MODEL_SCALE_PERCENT / 100,
+    );
+    if (scaleLength === null || scaleWidth === null || scaleHeight === null) {
+      throw new Error(`Building entry ${index + 1} has invalid scale values.`);
+    }
+
+    const rotationDeg = safeNumberInRange(propertiesRaw.rotationDeg, MIN_MODEL_ROTATION_DEG, MAX_MODEL_ROTATION_DEG);
+    if (rotationDeg === null) {
+      throw new Error(`Building entry ${index + 1} has invalid rotationDeg.`);
+    }
+
+    if (typeof propertiesRaw.type !== "string" || propertiesRaw.type.trim().length === 0) {
+      throw new Error(`Building entry ${index + 1} is missing type.`);
+    }
+
+    const entryIdRaw = entry.id;
+    const featureIdRaw =
+      typeof propertiesRaw.id === "string" || typeof propertiesRaw.id === "number"
+        ? propertiesRaw.id
+        : (featureObj.id as unknown);
+    const baseId =
+      typeof entryIdRaw === "string" || typeof entryIdRaw === "number"
+        ? String(entryIdRaw)
+        : typeof featureIdRaw === "string" || typeof featureIdRaw === "number"
+          ? String(featureIdRaw)
+          : `imported-building-${index + 1}`;
+    const uniqueId = makeUniqueBuildingId(baseId, usedIds);
+    usedIds.add(uniqueId);
+
+    const feature: GeoJSON.Feature<GeoJSON.Polygon> = {
+      type: "Feature",
+      id: uniqueId,
+      geometry: {
+        type: "Polygon",
+        coordinates,
+      },
+      properties: {
+        ...propertiesRaw,
+        id: uniqueId,
+        type: propertiesRaw.type,
+        modelType,
+        height,
+        baseHeight,
+        scaleLength,
+        scaleWidth,
+        scaleHeight,
+        rotationDeg,
+        selected: false,
+      },
+    };
+
+    result.push({
+      id: uniqueId,
+      feature,
+    });
+  }
+
+  return result;
+}
+
+function buildLayoutExportFile(buildings: ReadonlyMap<string, GeoJSON.Feature>): LayoutFileV1 {
+  const exportedBuildings: LayoutFileBuilding[] = [];
+  for (const [id, feature] of buildings.entries()) {
+    if (!feature.geometry || feature.geometry.type !== "Polygon") {
+      continue;
+    }
+    const properties = asPropertiesRecord(feature.properties);
+    const { selected: _selected, ...restProperties } = properties;
+    const coordinates = feature.geometry.coordinates.map((ring) =>
+      ring.map((position) => [Number(position[0]), Number(position[1])] as GeoJSON.Position),
+    );
+    exportedBuildings.push({
+      id,
+      feature: {
+        type: "Feature",
+        id,
+        geometry: {
+          type: "Polygon",
+          coordinates,
+        },
+        properties: {
+          ...restProperties,
+          id,
+        },
+      },
+    });
+  }
+
+  return {
+    format: LAYOUT_FILE_FORMAT,
+    version: LAYOUT_FILE_VERSION,
+    exportedAt: new Date().toISOString(),
+    buildings: exportedBuildings,
+  };
+}
 
 function parseRoadCollection(raw: unknown): RoadCollection {
   if (typeof raw !== "object" || raw === null) {
@@ -1304,6 +1574,7 @@ export default function App() {
   const dragPreviewFrameRef = useRef<number | null>(null);
   const dragPreviewPendingRef = useRef<{ center: [number, number]; template: BuildingTemplate } | null>(null);
   const topPopupTimerRef = useRef<number | null>(null);
+  const layoutFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [mapStyle, setMapStyle] = useState<MapboxStyle | string | null>(null);
   const [cursorCoordinates, setCursorCoordinates] = useState<{ lng: number; lat: number } | null>(
@@ -2390,6 +2661,86 @@ export default function App() {
     scheduleSimulation(0);
   }, [scheduleSimulation]);
 
+  const handleSaveBuildings = useCallback(() => {
+    const layout = buildLayoutExportFile(polygonBuildingsRef.current);
+    const now = new Date();
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const fileName = `toronto-layout-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}.json`;
+    const fileBlob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
+    const downloadUrl = URL.createObjectURL(fileBlob);
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(downloadUrl);
+    const countLabel = `${layout.buildings.length} building${layout.buildings.length === 1 ? "" : "s"}`;
+    showTopPopup(`Saved ${countLabel} to file.`, "info");
+    setStatusText(`Saved ${countLabel} to ${fileName}.`);
+  }, [showTopPopup]);
+
+  const handleLoadBuildingsClick = useCallback(() => {
+    const input = layoutFileInputRef.current;
+    if (!input) {
+      return;
+    }
+    input.value = "";
+    input.click();
+  }, []);
+
+  const handleLoadBuildingsFile = useCallback(
+    async (event: ReactChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget;
+      const file = input.files?.[0];
+      if (!file) {
+        return;
+      }
+
+      try {
+        if (polygonBuildingsRef.current.size > 0) {
+          const shouldReplace = window.confirm(
+            "Loading a saved layout will replace your current placed buildings. Continue?",
+          );
+          if (!shouldReplace) {
+            setStatusText("Load canceled.");
+            return;
+          }
+        }
+
+        const fileText = await file.text();
+        const importedBuildings = parseLayoutFileBuildings(fileText);
+        const nextBuildings = new Map<string, GeoJSON.Feature>();
+        for (const imported of importedBuildings) {
+          nextBuildings.set(imported.id, imported.feature);
+        }
+
+        polygonBuildingsRef.current = nextBuildings;
+        setPolygonBuildings(nextBuildings);
+        selectedPolygonBuildingIdRef.current = null;
+        setSelectedPolygonBuildingId(null);
+
+        const map = mapRef.current;
+        if (map) {
+          updatePolygonBuildingsSource(map, nextBuildings);
+          updateScenegraphOverlay(nextBuildings);
+        }
+
+        scheduleSimulation(0);
+        const countLabel = `${nextBuildings.size} building${nextBuildings.size === 1 ? "" : "s"}`;
+        showTopPopup(`Loaded ${countLabel} from file.`, "info");
+        setStatusText(`Loaded ${countLabel} from ${file.name}.`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unable to load layout file.";
+        showTopPopup(`Load failed: ${message}`, "warning");
+        setStatusText(`Load failed: ${message}`);
+      } finally {
+        input.value = "";
+      }
+    },
+    [scheduleSimulation, showTopPopup, updatePolygonBuildingsSource, updateScenegraphOverlay],
+  );
+
   const resolveTemplateFromDrag = useCallback(
     (event: ReactDragEvent<HTMLDivElement>): BuildingTemplate => {
       const dragPayload = event.dataTransfer.getData(BUILDING_TEMPLATE_MIME);
@@ -2832,6 +3183,21 @@ export default function App() {
           {topPopup.message}
         </div>
       ) : null}
+      <div className="layout-actions">
+        <button type="button" onClick={handleSaveBuildings}>
+          Save Buildings
+        </button>
+        <button type="button" onClick={handleLoadBuildingsClick}>
+          Load Buildings
+        </button>
+      </div>
+      <input
+        ref={layoutFileInputRef}
+        type="file"
+        accept=".json,application/json"
+        style={{ display: "none" }}
+        onChange={handleLoadBuildingsFile}
+      />
 
       <section className="controls">
         <h1>Toronto Reactive Traffic Heatmap</h1>
