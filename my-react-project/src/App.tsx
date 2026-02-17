@@ -2985,37 +2985,6 @@ export default function App() {
     }
   }, [removePolygonBuildingById]);
 
-  const handleSelectedBuildingHeightChange = useCallback((heightM: number) => {
-    const map = mapRef.current;
-    const selectedId = selectedPolygonBuildingIdRef.current;
-    if (!map || !selectedId) {
-      return;
-    }
-
-    setPolygonBuildings((prev) => {
-      const selectedFeature = prev.get(selectedId);
-      if (!selectedFeature) {
-        return prev;
-      }
-      const next = new Map(prev);
-      const properties = asPropertiesRecord(selectedFeature.properties);
-      next.set(selectedId, {
-        ...selectedFeature,
-        properties: {
-          ...properties,
-          height: Math.max(1, heightM),
-          selected: true,
-        },
-      });
-      polygonBuildingsRef.current = next;
-      updatePolygonBuildingsSource(map, next);
-      updateScenegraphOverlay(next);
-      return next;
-    });
-
-    scheduleSimulation(120);
-  }, [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay]);
-
   const rotateSelectedBuilding = useCallback((deltaDeg: number) => {
     const map = mapRef.current;
     const selectedId = selectedPolygonBuildingIdRef.current;
@@ -3050,52 +3019,6 @@ export default function App() {
 
     scheduleSimulation(0);
   }, [scheduleSimulation, updatePolygonBuildingsSource, updateScenegraphOverlay]);
-
-  const handleModelTypeChange = useCallback(
-    (modelType: BuildingModelType) => {
-      setSelectedModelType(modelType);
-      const modelOption = getBuildingModelOption(modelType);
-      console.log("[MODEL SELECT] Model type changed", {
-        modelType: modelOption.id,
-        modelLabel: modelOption.label,
-        modelUrl: modelOption.modelUrl,
-      });
-      const map = mapRef.current;
-      const selectedId = selectedPolygonBuildingIdRef.current;
-      if (!map || !selectedId) {
-        return;
-      }
-
-      setPolygonBuildings((prev) => {
-        const selectedFeature = prev.get(selectedId);
-        if (!selectedFeature) {
-          return prev;
-        }
-        const next = new Map(prev);
-        const properties = asPropertiesRecord(selectedFeature.properties);
-        next.set(selectedId, {
-          ...selectedFeature,
-          properties: {
-            ...properties,
-            modelType,
-            selected: true,
-          },
-        });
-        polygonBuildingsRef.current = next;
-        updatePolygonBuildingsSource(map, next);
-        updateScenegraphOverlay(next);
-        return next;
-      });
-
-      console.log("[BUILDING UPDATE] Updated selected building model", {
-        id: selectedId,
-        modelType: modelOption.id,
-        modelLabel: modelOption.label,
-        modelUrl: modelOption.modelUrl,
-      });
-    },
-    [updatePolygonBuildingsSource, updateScenegraphOverlay],
-  );
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
@@ -3158,17 +3081,6 @@ export default function App() {
       window.removeEventListener("keydown", handleGlobalKeyDown);
     };
   }, [handleDeleteSelectedBuilding, renderDragPreviewAt, rotateSelectedBuilding]);
-
-  const selectedBuildingFeature =
-    selectedPolygonBuildingId ? polygonBuildings.get(selectedPolygonBuildingId) ?? null : null;
-  const selectedBuildingProperties = asPropertiesRecord(selectedBuildingFeature?.properties);
-  const selectedHeightM = Math.max(
-    1,
-    Number.parseFloat(String(selectedBuildingProperties.height ?? BASE_BUILDING_HEIGHT_M)) ||
-      BASE_BUILDING_HEIGHT_M,
-  );
-  const selectedBuildingModelType =
-    asBuildingModelType(selectedBuildingProperties.modelType) ?? selectedModelType;
 
   return (
     <div className="app-shell">
@@ -3234,48 +3146,6 @@ export default function App() {
           onTemplateDragStart={handleTemplateDragStart}
           onTemplateDragEnd={handleTemplateDragEnd}
         />
-        <h2>Selected Building</h2>
-        <div className="shape-row">
-          <label htmlFor="building-model">3D Model</label>
-          <select
-            id="building-model"
-            value={selectedBuildingModelType}
-            onChange={(e) => handleModelTypeChange(e.target.value as BuildingModelType)}
-            disabled={!selectedPolygonBuildingId}
-          >
-            {BUILDING_MODEL_OPTIONS.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="shape-row">
-          <label htmlFor="shape-height">Height: {selectedHeightM.toFixed(1)}m</label>
-          <input
-            id="shape-height"
-            type="range"
-            min={5}
-            max={220}
-            step="1"
-            value={Math.round(selectedHeightM)}
-            onChange={(e) => handleSelectedBuildingHeightChange(Number(e.target.value))}
-            disabled={!selectedPolygonBuildingId}
-          />
-        </div>
-        <p className="shape-help">
-          {selectedPolygonBuildingId
-            ? `Selected: ${selectedPolygonBuildingId}. Rotate with R, Shift+R, [ or ].`
-            : "Select a building to adjust height or model."}
-        </p>
-        <button
-          type="button"
-          className="shape-cancel"
-          onClick={handleDeleteSelectedBuilding}
-          disabled={!selectedPolygonBuildingId}
-        >
-          Delete Selected Building
-        </button>
       </section>
 
       <SimulationResultsPanel
